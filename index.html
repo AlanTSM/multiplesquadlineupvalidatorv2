@@ -1954,6 +1954,33 @@
     const ESMS_SUPLENTES = 5;
     const ESMS_MAX_CAMBIOS = 3;
     const ESMS_TIPOS_COND = ['MIN', 'SCORE', 'SHOTS', 'YELLOW', 'RED', 'INJURED'];
+const ESMS_OPOS = ['OGK', 'ODF', 'ODM', 'OMF', 'OAM', 'OFW', 'OPL']; // posiciones del rival (OPL = cualquier jugador rival)
+const ESMS_HUECO = { RED: 0, YELLOW: 3, INJURED: 6 };
+const ESMS_NADIE = { RED: 'expulsen a ningún jugador tuyo', YELLOW: 'amonesten a ningún jugador tuyo', INJURED: 'se lesione ningún jugador tuyo' };
+
+// Cómo evaluará ESMS de verdad las condiciones RED/YELLOW/INJURED de una orden. ESMS guarda sus textos en tres
+// huecos seguidos de 3 bytes (RED, YELLOW, INJURED): las posiciones del rival (OGK, ODF…) ocupan 4 y pisan el hueco
+// siguiente, SUB <POS> copia esa posición en el hueco de INJURED, todas las CHANGEAGG comparten el mismo registro y
+// OPL o un hueco vacío se evalúan como número de jugador (0 si no se indicó ninguno).
+function condPosEfectivas(o, previo) {
+    const buf = previo ? previo.buf.slice() : new Array(12).fill('');
+    const num = previo ? Object.assign({}, previo.num) : { RED: 0, YELLOW: 0, INJURED: 0 };
+    const poner = (off, s) => { for (let i = 0; i < s.length && off + i < 12; i++) buf[off + i] = s[i]; if (off + s.length < 12) buf[off + s.length] = ''; };
+    const leer = off => { let s = ''; for (let i = off; i < 12 && buf[i]; i++) s += buf[i]; return s; };
+    if (o.cmd === 'SUB' && o.salePos) poner(ESMS_HUECO.INJURED, o.salePos);
+    const escrito = {};
+    o.conds.forEach(c => {
+        if (!(c.tipo in ESMS_HUECO)) return;
+        if (/^\d/.test(c.obj)) num[c.tipo] = parseInt(c.obj, 10); else poner(ESMS_HUECO[c.tipo], c.obj);
+        escrito[c.tipo] = c.obj;
+    });
+    const efect = {};
+    for (const tp of Object.keys(escrito)) {
+        const s = leer(ESMS_HUECO[tp]);
+        efect[tp] = (ESMS_POS.includes(s) || (ESMS_OPOS.includes(s) && s !== 'OPL')) ? { pos: s } : { num: num[tp] };
+    }
+    return { escrito, efect, buf, num };
+}
 
     function atoiESMS(tok) { const m = String(tok).match(/^\s*([+-]?\d+)/); return m ? parseInt(m[1], 10) : 0; }
     function esEnteroLimpio(tok) { return /^[+-]?\d+,?$/.test(tok); }
@@ -1983,8 +2010,8 @@
                     if (n < 1 || n > 16) return { error: `número de jugador no válido después de ${t}: "${o}" (1-16)` };
                     if (!/^\d+,?$/.test(o)) avisos.push(`"${o}" después de ${t} se leerá como ${n}`);
                     conds.push({ tipo: t, obj: String(n) });
-                } else if (ESMS_POS.includes(o)) conds.push({ tipo: t, obj: o });
-                else return { error: `posición no válida después de ${t}: "${o}" (GK, DF, DM, MF, AM, FW o 1-16, sin comas)` };
+                } else if (ESMS_POS.includes(o) || ESMS_OPOS.includes(o)) conds.push({ tipo: t, obj: o });
+                else return { error: `posición no válida después de ${t}: "${o}" (GK, DF, DM, MF, AM, FW, las del rival OGK, ODF, ODM, OMF, OAM, OFW, OPL o 1-16, sin comas)` };
                 k += 2;
             } else return { error: `condición desconocida "${t}" (válidas: MIN, SCORE, SHOTS, YELLOW, RED, INJURED, en MAYÚSCULAS; la coma solo puede ir pegada a un número)` };
         }
@@ -1997,7 +2024,7 @@
 
     // Intervalos efectivos (última condición de cada tipo) para saber si dos órdenes pueden cumplirse a la vez
     function intervalosCond(conds) {
-        const iv = { MIN: [1, 130], SCORE: [-99, 99], SHOTS: [0, 999] };
+        const iv = { MIN: [1, 120], SCORE: [-99, 99], SHOTS: [0, 999] }; // 1-93 en un partido normal (3 min de descuento), hasta 120 con prórroga
         const ult = {};
         conds.forEach(c => { if (iv[c.tipo]) ult[c.tipo] = c; });
         for (const t of Object.keys(ult)) {
@@ -2234,12 +2261,26 @@
         const entranPor = {}; subs.forEach(s => { (entranPor[s.entra] = entranPor[s.entra] || []).push(s); });
         const nombreDe = n => convocados[n - 1] ? convocados[n - 1].nombre : `nº ${n}`;
         const minIv = o => o.iv.MIN;
+        const aggs = ordenes.filter(o => o.cmd === 'CHANGEAGG');
+        let prevAgg = null;
+        ordenes.forEach(o => { o.cp = condPosEfectivas(o, o.cmd === 'CHANGEAGG' ? prevAgg : null); if (o.cmd === 'CHANGEAGG') prevAgg = o.cp; });
         for (const o of ordenes) {
             const [mlo, mhi] = minIv(o);
             const minC = o.conds.filter(c => c.tipo === 'MIN').pop();
             if (mlo > mhi || mhi < 1) A(`${o.linea}: la condición de minuto no se cumple nunca (ESMS la acepta, pero la orden no se ejecutará).`, o.linea);
-            else if (minC && mlo >= 100) A(`${o.linea}: el minuto ${mlo} solo existe si hay prórroga; en un partido normal esta orden no se ejecuta.`, o.linea);
-            else if (minC && mlo > 90) A(`${o.linea}: el minuto ${mlo} solo llega si hay suficiente tiempo de descuento; puede no ejecutarse nunca.`, o.linea);
+            else if (minC && mlo > 93) A(`${o.linea}: el minuto ${mlo} solo se juega si hay prórroga; en un partido normal (90 minutos + 3 de descuento) esta orden no se ejecuta.`, o.linea);
+            if (o.cmd === 'CHANGEAGG' && o !== aggs[aggs.length - 1]) continue; // se ignora entera (ver más abajo)
+            for (const tp of Object.keys(o.cp.escrito)) {
+                const w = o.cp.escrito[tp], e = o.cp.efect[tp];
+                if (/^\d/.test(w) ? (!('pos' in e) && e.num === parseInt(w, 10)) : e.pos === w) continue;
+                const motivo = w === 'OPL' ? `ESMS no sabe evaluar OPL`
+                    : ESMS_OPOS.includes(w) ? `las posiciones del rival (OGK, ODF…) no caben en el espacio que ESMS les reserva y se mezclan con la otra condición RED/YELLOW/INJURED de la orden`
+                    : (o.cmd === 'SUB' && o.salePos && tp === 'INJURED') ? `con "SUB ${o.salePos}" ESMS guarda esa posición en el mismo sitio que la condición INJURED`
+                    : o.cmd === 'CHANGEAGG' ? `ESMS guarda todas las CHANGEAGG en el mismo sitio y esta condición se mezcla con la de una CHANGEAGG anterior`
+                    : `ESMS la mezcla con otra condición RED/YELLOW/INJURED de la orden`;
+                const como = 'pos' in e ? `«${tp} ${e.pos}»` : e.num === 0 ? `«${tp} 0», que se cumple en cualquier minuto en que no ${ESMS_NADIE[tp]} (casi siempre: la orden puede ejecutarse ya en el minuto 1)` : `«${tp} ${e.num}»`;
+                A(`${o.linea}: la condición «${tp} ${w}» no hará lo que esperas: ${motivo}, así que la evaluará como ${como}.`, o.linea);
+            }
         }
         subs.forEach((s, k) => {
             if (s.entra <= 11) A(`${s.linea}: el nº ${s.entra} (${nombreDe(s.entra)}) es titular y ya está en el campo; este cambio no se hará nunca.`, s.linea);
@@ -2250,10 +2291,21 @@
             if (previa && s.entra >= 12) A(`${s.linea}: el suplente nº ${s.entra} (${nombreDe(s.entra)}) ya entra en "${previa.linea}". Solo se hará la primera de las dos que se cumpla; la otra se ignorará.`, s.linea);
             const previaSale = s.sale ? subs.slice(0, k).find(x => x.sale === s.sale) : null;
             if (previaSale) A(`${s.linea}: el nº ${s.sale} (${nombreDe(s.sale)}) ya sale en "${previaSale.linea}". Solo se hará la primera de las dos que se cumpla; la otra se ignorará.`, s.linea);
-            const saleGK = s.sale === 1 || s.salePos === 'GK';
-            if (saleGK && s.pos !== 'GK') A(`${s.linea}: sale el portero y el que entra jugará de ${s.pos}. El equipo se quedará SIN PORTERO (ESMS no lo corrige).`, s.linea);
-            if (!saleGK && s.pos === 'GK') A(`${s.linea}: entra un jugador de GK sin que salga el portero: habrá dos porteros en el campo.`, s.linea);
             const dIn = convocados[s.entra - 1] && convocados[s.entra - 1].datos;
+            const ef = s.cp.efect;
+            const rojaGK = ef.RED && (ef.RED.pos === 'GK' || ef.RED.num === 1);
+            const lesGK = ef.INJURED && (ef.INJURED.pos === 'GK' || ef.INJURED.num === 1);
+            const saleGK = s.sale === 1 || s.salePos === 'GK';
+            if (rojaGK && saleGK) { s.nunca = true; A(`${s.linea}: el portero expulsado ya no está en el campo y ESMS no puede sustituirlo, así que este cambio no se hará nunca. Para meter al portero suplente tras la roja, saca a un jugador de campo (p. ej. "SUB 9 ${s.entra} GK IF RED GK").`, s.linea); }
+            else if (ef.RED && ef.RED.num && s.sale === ef.RED.num) { s.nunca = true; A(`${s.linea}: el nº ${s.sale} (${nombreDe(s.sale)}) es el expulsado y ya no está en el campo, así que este cambio no se hará nunca. Saca a otro jugador.`, s.linea); }
+            else if (ef.RED && ef.RED.pos && s.salePos === ef.RED.pos) A(`${s.linea}: el ${s.salePos} expulsado ya no está en el campo, así que ESMS sacará a otro ${s.salePos} (el de peor nota) para meter a ${nombreDe(s.entra)}. Si querías reforzar esa línea, saca a un jugador de otra posición (p. ej. "SUB 10 ${s.entra} ${s.pos} IF RED ${s.salePos}").`, s.linea);
+            else if (saleGK && s.pos !== 'GK') A(`${s.linea}: sale el portero y ${nombreDe(s.entra)} entra como ${s.pos}: ESMS lo pondrá igualmente en la portería (parará con su St${dIn ? ' ' + dIn.st : ''}). Si querías meter a otro portero, pon GK.`, s.linea);
+            else if (!saleGK && s.pos === 'GK' && !rojaGK && !lesGK) A(`${s.linea}: entra ${nombreDe(s.entra)} de GK sin que salga el portero ni haya sido expulsado (falta IF RED GK): ${nombreDe(s.entra)} pasará a ser el portero y ${nombreDe(1)} seguirá en el campo como GK, sin aportar nada en el juego. Si es para cuando expulsen al portero, añade IF RED GK; si quieres cambiar de portero, saca al nº 1.`, s.linea);
+            if (ef.INJURED && s.sale && s.sale <= 11 && !lesGK) {
+                const p = ef.INJURED.pos;
+                const otroPuede = p ? (ESMS_POS.includes(p) && convocados.slice(0, 11).some((t, k) => k + 1 !== s.sale && t.posicion === p)) : ef.INJURED.num !== s.sale;
+                if (otroPuede) A(`${s.linea}: si se lesiona ${p ? `un ${p} que no sea el nº ${s.sale}` : `el nº ${ef.INJURED.num}`}, ESMS sacará igualmente al nº ${s.sale} (${nombreDe(s.sale)}) y el lesionado se sustituirá aparte con un cambio automático (se gastan dos cambios). Para que salga el lesionado, usa ${p ? `"SUB ${p} ${s.entra} ${s.pos} IF INJURED ${p}"` : `"SUB ${ef.INJURED.num} ${s.entra} ${s.pos} IF INJURED ${ef.INJURED.num}"`}.`, s.linea);
+            }
             if (s.pos === 'GK' && dIn && s.entra >= 12 && !esPorteroPorHabilidad(dIn)) A(`${s.linea}: ${nombreDe(s.entra)} va a jugar de portero, pero no es portero (St ${dIn.st}).`, s.linea);
             if (pkNombre && s.sale && nombreDe(s.sale) === pkNombre) A(`${s.linea}: sale el lanzador de penaltis (${pkNombre}); a partir de ahí ESMS elegirá otro lanzador.`, s.linea);
         });
@@ -2263,6 +2315,7 @@
         cps.forEach((c, k) => {
             if (c.num === 1) A(`${c.linea}: ESMS no cambia de posición al portero titular; esta orden se ignora.`, c.linea);
             if (c.pos === 'GK') A(`${c.linea}: ESMS no permite pasar a un jugador a GK con CHANGEPOS; esta orden se ignora.`, c.linea);
+        if (c.cp.efect.RED && c.cp.efect.RED.num === c.num && c.num !== 1) A(`${c.linea}: el nº ${c.num} (${nombreDe(c.num)}) es el expulsado y ya no está en el campo; esta orden no hará nada.`, c.linea);
             if (c.num >= 12 && !entranPor[c.num]) A(`${c.linea}: el nº ${c.num} (${nombreDe(c.num)}) es suplente y ninguna orden lo mete en el campo; no se aplicará nunca.`, c.linea);
             const posActual = c.num >= 12 && entranPor[c.num] ? entranPor[c.num][0].pos : posInicial[c.num];
             if (posActual === c.pos && !cps.some(x => x !== c && x.num === c.num)) A(`${c.linea}: el nº ${c.num} (${nombreDe(c.num)}) ya juega de ${c.pos}; esta orden no cambia nada.`, c.linea);
@@ -2278,7 +2331,7 @@
                 const prueba = Object.assign({}, estado);
                 if (o.cmd === 'CHANGEPOS') { if (!(o.num in prueba)) return; prueba[o.num] = o.pos; }
                 else {
-                    if (o.entra <= 11) return;
+                    if (o.entra <= 11 || o.nunca) return;
                     let sale = o.sale;
                     if (o.salePos) sale = Object.keys(prueba).find(n => prueba[n] === o.salePos);
                     if (!sale || !(sale in prueba)) return;
@@ -2295,9 +2348,8 @@
         tacs.forEach((t, k) => tacs.slice(0, k).filter(x => puedenCoincidir(x.iv, t.iv)).forEach(x =>
             A(`"${x.linea}" y "${t.linea}" pueden cumplirse a la vez. Cuando se cumplen dos órdenes TACTIC a la vez, ESMS no aplica NINGUNA (se queda la táctica que hubiera). Haz que sus condiciones no se solapen.`, t.linea)));
         if (tacs.length === 1 && tacs[0].tactica === tactica) A(`${tacs[0].linea}: la táctica ${tactica} ya es la táctica inicial; esta orden no cambia nada.`, tacs[0].linea);
-        const aggs = ordenes.filter(o => o.cmd === 'CHANGEAGG');
-        aggs.forEach((t, k) => aggs.slice(0, k).filter(x => x.agg !== t.agg && puedenCoincidir(x.iv, t.iv)).forEach(x =>
-            A(`"${x.linea}" y "${t.linea}" pueden cumplirse a la vez; no está claro cuál mandará. Haz que sus condiciones no se solapen.`, t.linea)));
+        if (aggs.length > 1) aggs.slice(0, -1).forEach(x =>
+            A(`${x.linea}: ESMS solo tiene en cuenta la ÚLTIMA orden CHANGEAGG de la alineación ("${aggs[aggs.length - 1].linea}"); esta se ignorará.`, x.linea));
         return { errores, avisos };
     }
 
